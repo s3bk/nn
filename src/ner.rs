@@ -334,7 +334,7 @@ impl NerTagger {
             
             let seconds = t0.elapsed().as_secs_f32();
             info!("batch nr. {} is complete in {} seconds. ({} bytes/s)",
-                seconds, batch_nr, total as f32 / seconds);
+                batch_nr, seconds, total as f32 / seconds);
             batch_nr += 1;
 
             Some(groups.into_iter().zip(batch_input.into_iter().enumerate())
