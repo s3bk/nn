@@ -18,6 +18,10 @@ struct FlairOpt {
     #[argh(option, default="1024 * 16")]
     size: usize,
 
+    /// model file
+    #[argh(option, default="String::from(\"model.npz\")")]
+    model: String,
+
     /// file to run
     #[argh(positional)]
     file: String
@@ -25,13 +29,12 @@ struct FlairOpt {
 
 fn main() {
     env_logger::init();
-    let path = "model.npz";
+    let opt = argh::from_env::<FlairOpt>();
 
-    let file = File::open(path).unwrap();
+    let file = File::open(&opt.model).unwrap();
     let model = Model::load(file).unwrap();
     let ner = NerTagger::new(model);
 
-    let opt = argh::from_env::<FlairOpt>();
 
     let file = File::open(&opt.file).unwrap();
     let reader = BufReader::new(file);

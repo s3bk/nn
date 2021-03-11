@@ -129,12 +129,15 @@ impl NerTagger {
 
             // distribute batch input to queues
             for (idx, input) in batch_input.iter().enumerate() {
-                let (_, min_q) = queues.iter_mut().min_by_key(|(_ , q)| q.len()).unwrap();
-                min_q.push((idx, input.as_ref()));
+                let (n, min_q) = queues.iter_mut().min_by_key(|(n, _)| *n).unwrap();
+                let text = input.as_ref();
+                min_q.push((idx, text));
+                *n += text.len();
             }
             
             //println!("queues {:#?}", &queues);
             info!("queue sizes: {}", queues.iter().map(|(_, q)| q.len()).format(", "));
+            info!("queue lenghts: {}", queues.iter().map(|(n, _)| n).format(", "));
 
             #[derive(Default)]
             struct TokenQueue<'a> {
