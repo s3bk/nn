@@ -49,7 +49,7 @@ def dump_array(key, a):
 def dump_dict(key, d):
     dump_array(key, np.array(list(b"\xff".join(d)), dtype="B"))
 
-tagger = SequenceTagger.load("/home/sebk/.flair/models/en-ner-fast-conll03-v0.4.pt")
+tagger = SequenceTagger.load("ner-fast")
 
 out = {}
 for e in tagger.embeddings.embeddings:
