@@ -4,9 +4,23 @@ use crate::lstm::*;
 use unicode_segmentation::UnicodeSegmentation;
 use itertools::Itertools;
 use std::time::Instant;
+use crate::utils::*;
+use rayon::prelude::*;
+use std::ops::{Deref, DerefMut};
+use std::iter::{once, repeat};
+use std::marker::PhantomData;
 
-pub struct NerTagger {
-    model: Model
+#[cfg(feature="gpu")]
+use cuda::{Device, Context, Module, CudaError};
+
+pub struct NerTagger<'a> {
+    model: Model,
+
+    #[cfg(feature="gpu")]
+    cuda: Option<(&'a Context, Module<'a>)>,
+
+    #[cfg(not(feature="gpu"))]
+    cuda: PhantomData<&'a ()>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,9 +52,83 @@ impl Default for ParallelConfig {
     }
 }
 
-impl NerTagger {
+//static MODULE_DATA: &[u8] = include_bytes!("../../ptx_linalg/ptx_linalg.cubin");
+
+#[derive(Default)]
+struct TokenQueue<'a> {
+    num_tokens: usize,
+
+    // (input_id, num_tokens)
+    meta: Vec<(usize, usize)>,
+
+    // shared across inputs
+    tokens: Vec<&'a str>,
+    offsets: Vec<usize>,
+    glove: Vec<Vector<GLOVE_EMBEDDING>>,
+    forward: Vec<Vector<FORWARD_EMBEDDING>>,
+    reverse: Vec<Vector<REVERSE_EMBEDDING>>,
+    embeddings: Vec<Vector<EMBEDDINGS>>,
+    rnn_forward: Vec<Vector<RNN_SIZE>>,
+    rnn_reverse: Vec<Vector<RNN_SIZE>>,
+    features: Vec<Vector<FEATURES>>,
+    tags: Vec<u8>,
+}
+
+macro_rules! pass {
+    (iter $q:ident ($($input:ident),*), $output:ident, $pass:expr) => ({
+        let input = ($( AsRef::<[_]>::as_ref(&$q.$input) ),* );
+        let output = AsMut::<[_]>::as_mut(&mut $q.$output);
+        let splits = $q.meta.iter().map(|&(_, num_tokens)| num_tokens);
+
+        let input = input.splits(splits.clone());
+        let output = output.splits(splits);
+        #[allow(unused_parens)]
+        input.zip(output).flat_map(|(($($input),*) , $output)| $pass)
+    });
+    (
+        $queues:ident,
+        $cuda_model:ident,
+        input $($input:ident),* ;
+        output $output:ident ;
+        pass $pass:expr,
+        cpu $cpu:expr,
+        gpu $model:ident $gpu:expr,
+    ) => ({
+        #[cfg(feature="gpu")]
+        if let Some(ref mut $model) = $cuda_model {
+            let iter = $queues.iter_mut().map(|q| pass!(iter q ($($input),*), $output, $pass));
+            $gpu(iter).unwrap();
+        } else {
+            $queues.par_iter_mut().for_each(|q| {
+                let iter = pass!(iter q ($($input),*), $output, $pass);
+                $cpu(iter)
+            });
+        }
+
+        #[cfg(not(feature="gpu"))]
+        $queues.par_iter_mut().for_each(|q| {
+            let iter = pass!(iter q ($($input),*), $output, $pass);
+            $cpu(iter)
+        });
+    });
+}
+
+impl<'a> NerTagger<'a> {
     pub fn new(model: Model) -> Self {
-        NerTagger { model }
+        NerTagger {
+            model,
+            #[cfg(not(feature="gpu"))]
+            cuda: PhantomData,
+            #[cfg(feature="gpu")]
+            cuda: None,
+        }
+    }
+    #[cfg(feature="gpu")]
+    pub fn new_with_context(model: Model, context: &'a Context) -> Result<Self, CudaError> {
+        let data = std::fs::read("../ptx_linalg/ptx_linalg.cubin").unwrap();
+        let module = context.create_module(data)?;
+
+        Ok(NerTagger { model, cuda: Some((context, module)) })
     }
     pub fn tag_name(&self, tag: Tag) -> &str {
         &*self.model.tags[tag.0 as usize]
@@ -49,15 +137,15 @@ impl NerTagger {
         self.model.tags.iter().position(|n| &**n == name).map(|n| Tag(n as u8))
     }
     pub fn tag(&self, text: &str) -> Vec<Token> {
-        let (tokens_indices, tokens): (Vec<_>, Vec<_>) = self.tokenize(text).unzip();
+        let (tokens_indices, tokens): (Vec<_>, Vec<_>) = tokenize(text).unzip();
 
         let mut glove_v = vec![Vector::null(); tokens.len()];
         let mut forward_v = vec![Vector::null(); tokens.len()];
         let mut reverse_v = vec![Vector::null(); tokens.len()];
 
-        self.glove_embedding(&tokens, &mut glove_v);
-        self.forward_embedding(&tokens, &mut forward_v);
-        self.reverse_embedding(&tokens, &mut reverse_v);
+        self.model.glove_embedding(&tokens, &mut glove_v);
+        self.model.forward_embedding(&tokens, &mut forward_v);
+        self.model.reverse_embedding(&tokens, &mut reverse_v);
 
         let mut embeddings = Vec::with_capacity(tokens.len());
 
@@ -89,16 +177,21 @@ impl NerTagger {
             ).collect();
 
         let mut tags = vec![0; features.len()];
-        self.viterbi_decode(&features, &mut tags);
+        self.model.viterbi_decode(&features, &mut tags);
         izip!(tokens_indices, tokens, tags).map(|(pos, token, tag_id)|
             Token { pos, len: token.len(), tag: Tag(tag_id) }
         ).collect()
     }
-    pub fn tag_par<'a, I, T>(&'a self, mut input: I, config: ParallelConfig) -> impl Iterator<Item=Tokens<T>> + 'a
-    where I: Iterator<Item=T> + 'a, T: AsRef<str> + 'a
+    pub fn tag_par<'b, I, T>(&'b self, mut input: I, config: ParallelConfig) -> impl Iterator<Item=Tokens<T>> + 'b
+    where I: Iterator<Item=(usize, T)> + 'b, T: AsRef<str> + 'b
     {
-        use rayon::prelude::*;
         info!("running batches of ~{} bytes in {} queues", config.batch_size, config.num_queues);
+
+        #[cfg(feature="gpu")]
+        let mut cuda_model = self.cuda.as_ref().map(|&(context, ref module)| CudaModel::load(&self.model, context, module).unwrap());
+
+        #[cfg(not(feature="gpu"))]
+        let cuda_model = ();
 
         let mut batch_nr = 0;
         std::iter::from_fn(move || {
@@ -107,13 +200,13 @@ impl NerTagger {
             let mut total = 0;
             let t0 = Instant::now();
 
-            while let Some(input) = input.next() {
+            while let Some((idx, input)) = input.next() {
                 let text = input.as_ref();
                 if text.len() == 0 {
                     continue;
                 }
                 total += text.len();
-                batch_input.push(input);
+                batch_input.push((idx, input));
 
                 if total > config.batch_size {
                     break;
@@ -128,10 +221,10 @@ impl NerTagger {
             // batch input is now stable and can be borrowed
 
             // distribute batch input to queues
-            for (idx, input) in batch_input.iter().enumerate() {
+            for (idx, input) in batch_input.iter() {
                 let (n, min_q) = queues.iter_mut().min_by_key(|(n, _)| *n).unwrap();
                 let text = input.as_ref();
-                min_q.push((idx, text));
+                min_q.push((*idx, text));
                 *n += text.len();
             }
             
@@ -139,25 +232,6 @@ impl NerTagger {
             info!("queue sizes: {}", queues.iter().map(|(_, q)| q.len()).format(", "));
             info!("queue lenghts: {}", queues.iter().map(|(n, _)| n).format(", "));
 
-            #[derive(Default)]
-            struct TokenQueue<'a> {
-                num_tokens: usize,
-
-                // (input_id, num_tokens)
-                meta: Vec<(usize, usize)>,
-
-                // shared across inputs
-                tokens: Vec<&'a str>,
-                offsets: Vec<usize>,
-                glove: Vec<Vector<GLOVE_EMBEDDING>>,
-                forward: Vec<Vector<FORWARD_EMBEDDING>>,
-                reverse: Vec<Vector<REVERSE_EMBEDDING>>,
-                embeddings: Vec<Vector<EMBEDDINGS>>,
-                rnn_forward: Vec<Vector<RNN_SIZE>>,
-                rnn_reverse: Vec<Vector<RNN_SIZE>>,
-                features: Vec<Vector<FEATURES>>,
-                tags: Vec<u8>,
-            }
 
             // tokenize each queue
             info!("tokenizing");
@@ -168,7 +242,7 @@ impl NerTagger {
                 let mut num_tokens = 0;
                 for &(input_id, text) in queue {
                     let mut text_tokens = 0;
-                    for (token_offset, token) in self.tokenize(text) {
+                    for (token_offset, token) in tokenize(text) {
                         if token.chars().all(char::is_whitespace) {
                             continue;
                         }
@@ -187,6 +261,8 @@ impl NerTagger {
                 }
             }).collect();
 
+            let model = &self.model;
+
             // glove pass
             info!("glove embeddings");
             token_queues.par_iter_mut().for_each(|queue| {
@@ -194,101 +270,125 @@ impl NerTagger {
                 let mut start = 0;
                 for &(_, num_tokens) in &queue.meta {
                     let end = start + num_tokens;
-                    self.glove_embedding(&queue.tokens[start..end], &mut queue.glove[start..end]);
+                    model.glove_embedding(&queue.tokens[start..end], &mut queue.glove[start..end]);
                     start = end;
                 }
             });
+
+            let init_state = &LstmState::null();
+            let embedding = &self.model.embeddings_forward;
+            let start_marker = '\n';
+            let end_marker = ' ';
+            let v_start = &embedding.chars[&start_marker];
+            let v_end = &embedding.chars[&end_marker];
 
             // forward pass
             info!("forward char embeddings");
-            token_queues.par_iter_mut().for_each(|q| {
-                q.forward.resize(q.num_tokens, Vector::null());
-                let mut start = 0;
-                for &(_, num_tokens) in &q.meta {
-                    let end = start + num_tokens;
-                    self.forward_embedding(&q.tokens[start..end], &mut q.forward[start..end]);
-                    start = end;
-                }
-            });
+            token_queues.iter_mut().for_each(|q| q.forward.resize(q.num_tokens, Vector::null()));
+
+            pass!(token_queues, cuda_model,
+                input tokens;
+                output forward;
+                pass {
+                    let head = std::iter::once((Some(init_state), v_start, None));
+                    let body = tokens.iter().zip(forward).flat_map(|(&token, out)| {
+                        token.chars().filter_map(|c| embedding.chars.get(&c))
+                            .map(|v| (None, v, None))
+                            .chain(std::iter::once((None, v_end, Some(out))))
+                    });
+    
+                    head.chain(body)
+                },
+                cpu |iter| model.embeddings_forward.rnn.run(iter),
+                gpu model |iter| model.embeddings_forward.run_batched(iter),
+            );
 
             // reverse pass
             info!("reverse char embeddings");
-            token_queues.par_iter_mut().for_each(|q| {
-                q.reverse.resize(q.num_tokens, Vector::null());
-                let mut start = 0;
-                for &(_, num_tokens) in &q.meta {
-                    let end = start + num_tokens;
-                    self.reverse_embedding(&q.tokens[start..end], &mut q.reverse[start..end]);
-                    start = end;
-                }
-            });
+            token_queues.iter_mut().for_each(|q| q.reverse.resize(q.num_tokens, Vector::null()));
+
+            pass!(token_queues, cuda_model,
+                input tokens;
+                output reverse;
+                pass {
+                    let head = std::iter::once((Some(init_state), v_start, None));
+                    let body = tokens.iter().zip(reverse).rev().flat_map(|(&token, out)| {
+                        token.chars().filter_map(|c| embedding.chars.get(&c))
+                            .map(|v| (None, v, None))
+                            .chain(std::iter::once((None, v_end, Some(out))))
+                    });
+    
+                    head.chain(body)
+                },
+                cpu |iter| model.embeddings_reverse.rnn.run(iter),
+                gpu model |iter| model.embeddings_reverse.run_batched(iter),
+            );
 
             // transform embeddings
             info!("transforming embeddings");
-            token_queues.par_iter_mut().for_each(|q| {
-                q.embeddings.resize(q.num_tokens, Vector::null());
+            token_queues.iter_mut().for_each(|q| q.embeddings.resize(q.num_tokens, Vector::null()));
 
-                for (forward, reverse, glove, out) in izip!(&q.forward, &q.reverse, &q.glove, &mut q.embeddings) {
-                    let embedding = glove.concat2(&reverse, &forward);
-                    *out = self.model.embedding2nn.transform(&embedding);
-                }
-                q.glove = vec![];
-                q.forward = vec![];
-                q.reverse = vec![];
-            });
+            pass!(token_queues, cuda_model,
+                input glove, forward, reverse;
+                output embeddings;
+                pass {
+                    izip!(glove.iter(), forward.iter(), reverse.iter())
+                    .map(|(glove, forward, reverse)| glove.concat2(&reverse, &forward))
+                    .zip(embeddings.iter_mut())
+                },
+                cpu |iter| model.embedding2nn.run(iter),
+                gpu model |iter| model.embeddings2rnn.run_batched(iter),
+            );
 
             // RNN forward
             info!("forward RNN");
-            token_queues.par_iter_mut().for_each(|q| {
+            token_queues.iter_mut().for_each(|q| {
                 q.rnn_forward.resize(q.num_tokens, Vector::null());
-
-                let mut start = 0;
-                for &(_, num_tokens) in &q.meta {
-                    let end = start + num_tokens;
-                    let mut state_forward = LstmState::null();
-                    let embedding = &q.embeddings[start..end];
-                    let rnn_forward = &mut q.rnn_forward[start..end];
-
-                    for (embedding, out) in embedding.iter().zip(rnn_forward.iter_mut()) {
-                        self.model.rnn.step(&mut state_forward, embedding);
-                        *out = state_forward.h;
-                    }
-
-                    start = end;
-                }
+                q.rnn_reverse.resize(q.num_tokens, Vector::null());
             });
+
+            let init = &LstmState::null();
+            pass!(token_queues, cuda_model,
+                input embeddings;
+                output rnn_forward;
+                pass {
+                    let state = once(Some(init)).chain(repeat(None));
+                    izip!(state, embeddings, rnn_forward.iter_mut().map(Some))
+                },
+                cpu |iter| model.rnn.run(iter),
+                gpu model |iter| model.rnn.run_batched(iter),
+            );
 
             // RNN reverse
             info!("reverse RNN");
-            token_queues.par_iter_mut().for_each(|q| {
-                q.rnn_reverse.resize(q.num_tokens, Vector::null());
-                let mut start = 0;
-                for &(_, num_tokens) in &q.meta {
-                    let end = start + num_tokens;
-                    let mut state_reverse = LstmState::null();
-                    let embedding = &q.embeddings[start..end];
-                    let rnn_reverse = &mut q.rnn_reverse[start..end];
-
-                    for (embedding, out) in embedding.iter().zip(rnn_reverse.iter_mut()).rev() {
-                        self.model.rnn_reverse.step(&mut state_reverse, embedding);
-                        *out = state_reverse.h;
-                    }
-
-                    start = end;
-                }
-                q.embeddings = vec![];
-            });
+            pass!(token_queues, cuda_model,
+                input embeddings;
+                output rnn_reverse;
+                pass {
+                    let state = once(Some(init)).chain(repeat(None));
+                    state.zip(embeddings.iter().zip(rnn_reverse).rev())
+                    .map(|(s, (i, o))| (s, i, Some(o)))
+                },
+                cpu |iter| model.rnn.run(iter),
+                gpu model |iter| model.rnn.run_batched(iter),
+            );
             
             // feature transform
             info!("transforming features");
-            token_queues.par_iter_mut().for_each(|q| {
+            token_queues.iter_mut().for_each(|q| {
                 q.features.resize(q.num_tokens, Vector::null());
-                for (out, forward, reverse) in izip!(&mut q.features, &q.rnn_forward, &q.rnn_reverse) {
-                    *out = self.model.linear.transform(&forward.concat(reverse));
-                }
-                q.rnn_forward = vec![];
-                q.rnn_reverse = vec![];
             });
+            pass!(token_queues, cuda_model,
+                input rnn_forward, rnn_reverse;
+                output features;
+                pass {    
+                    rnn_forward.iter().zip(rnn_reverse)
+                    .map(|(forward, reverse)| forward.concat(reverse))
+                    .zip(features)
+                },
+                cpu |iter| model.linear.run(iter),
+                gpu model |iter| model.linear.run_batched(iter),
+            );
 
             // tag extraction
             info!("extracting tags");
@@ -298,7 +398,7 @@ impl NerTagger {
                 let mut start = 0;
                 for &(_, num_tokens) in &q.meta {
                     let end = start + num_tokens;
-                    self.viterbi_decode(&q.features[start..end], &mut q.tags[start..end]);
+                    model.viterbi_decode(&q.features[start..end], &mut q.tags[start..end]);
 
                     start = end;
                 }
@@ -340,7 +440,7 @@ impl NerTagger {
                 batch_nr, seconds, total as f32 / seconds);
             batch_nr += 1;
 
-            Some(groups.into_iter().zip(batch_input.into_iter().enumerate())
+            Some(groups.into_iter().zip(batch_input.into_iter())
                 .map(|((idx1, tokens), (idx2, input))| {
                     assert_eq!(idx1, idx2);
                     Tokens { input, tokens }
@@ -348,112 +448,10 @@ impl NerTagger {
             )
         }).flatten()
     }
-    fn forward_embedding(&self, tokens: &[&str], out: &mut[Vector<FORWARD_EMBEDDING>]) {
-        let embedding = &self.model.embeddings_forward;
-        let mut state = LstmState::null();
-        let start_marker = '\n';
-        let end_marker = ' ';
-        let v_start = &embedding.chars[&start_marker];
-        let v_end = &embedding.chars[&end_marker];
+}
 
-        embedding.rnn.step(&mut state, v_start);
-        for (&token, out) in tokens.iter().zip(out) {
-            for c in token.chars() {
-                if let Some(v) = embedding.chars.get(&c) {
-                    embedding.rnn.step(&mut state, v);
-                }
-            }
-            embedding.rnn.step(&mut state, v_end);
-            *out = state.h;
-        }
-    }
-
-    fn reverse_embedding(&self, tokens: &[&str], out: &mut [Vector<REVERSE_EMBEDDING>]) {
-        let embedding = &self.model.embeddings_reverse;
-        let mut state = LstmState::null();
-        let start_marker = '\n';
-        let end_marker = ' ';
-        let v_start = &embedding.chars[&start_marker];
-        let v_end = &embedding.chars[&end_marker];
-
-        embedding.rnn.step(&mut state, v_start);
-        for (&token, out) in tokens.iter().zip(out).rev() {
-            for c in token.chars().rev() {
-                if let Some(v) = embedding.chars.get(&c) {
-                    embedding.rnn.step(&mut state, v);
-                }
-            }
-            embedding.rnn.step(&mut state, v_end);
-            *out = state.h;
-        }
-    }
-    fn glove_embedding(&self, tokens: &[&str], out: &mut [Vector<GLOVE_EMBEDDING>]) {
-        let embedding = &self.model.embeddings_glove;
-
-        for (&token, out) in tokens.iter().zip(out) {
-            if let Some(v) = embedding.get(token) {
-                *out = *v;
-                continue;
-            }
-            let lowercase = token.to_lowercase();
-            if let Some(v) = embedding.get(&lowercase) {
-                *out = *v;
-                continue;
-            }
-
-            let fenced = lowercase.replace(|c: char| c.is_ascii_digit(), "#");
-            if let Some(v) = embedding.get(&fenced) {
-                *out = *v;
-                continue;
-            }
-
-            let nulled = lowercase.replace(|c: char| c.is_ascii_digit(), "0");
-            if let Some(v) = embedding.get(&nulled) {
-                *out = *v;
-                continue;
-            }
-            
-            *out = Vector::null();
-        }
-    }
-    fn viterbi_decode(&self, features: &[Vector<20>], out: &mut [u8]) {
-        let id_start = self.model.tags.iter().position(|t| &**t == "<START>").unwrap();
-        let id_stop = self.model.tags.iter().position(|t| &**t == "<STOP>").unwrap();
-
-        let mut backpointers = vec![[0; FEATURES]; features.len()];
-        let mut backscores = vec![Vector::null(); features.len()];
-
-        let mut forward_var = Vector::splat(-1e4);
-        forward_var.set(id_start, 0.0);
-
-        for (index, feat) in features.iter().enumerate() {
-            let (viterbivars_t, bptrs_t) = self.model.transitions.argmax1(&forward_var);
-            forward_var = viterbivars_t + feat;
-            backscores[index] = forward_var;
-            backpointers[index] = bptrs_t;
-        }
-
-        let mut terminal_var = forward_var + self.model.transitions[id_stop];
-        terminal_var[id_stop] = -1e5;
-        terminal_var[id_start] = -1e5;
-
-        let (mut best_tag_id, _) = terminal_var.max_idx();
-        let mut best_path = vec![best_tag_id];
-        for bptrs_t in backpointers.iter().rev() {
-            best_tag_id = bptrs_t[best_tag_id];
-            best_path.push(best_tag_id);
-        }
-
-        let start = best_path.pop().unwrap();
-        if start != id_start {
-            error!("expected <START>, found {}", self.tag_name(Tag(start as u8)));
-        }
-        out.iter_mut().zip(best_path.iter().rev()).for_each(|(o, i)| *o = *i as u8);
-    }
-
-    fn tokenize<'a>(&'a self, text: &'a str) -> impl Iterator<Item=(usize, &'a str)> + 'a
-    {
-        text.split_word_bound_indices()
-        .filter(|(_, s)| s.len() > 0 && !s.chars().all(char::is_whitespace))
-    }
+fn tokenize<'a>(text: &'a str) -> impl Iterator<Item=(usize, &'a str)> + 'a
+{
+    text.split_word_bound_indices()
+    .filter(|(_, s)| s.len() > 0 && !s.chars().all(char::is_whitespace))
 }
